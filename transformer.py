@@ -93,9 +93,15 @@ class TransformerLayer(nn.Module):
         # Output linear layer to project back to d_model
         self.output_layer = nn.Linear(d_internal, d_model)
 
+        # Dropout for attention output
+        self.attention_dropout = nn.Dropout(0.1)
+
         # Feed-forward network layers
         self.fc1 = nn.Linear(d_model, d_internal)
         self.fc2 = nn.Linear(d_internal, d_model)
+
+        # Dropout for feed-forward output
+        self.ff_dropout = nn.Dropout(0.1)
 
     def forward(self, input_vecs):
         # Self-attention
@@ -112,6 +118,8 @@ class TransformerLayer(nn.Module):
 
         # Project the attention output back to d_model dimensions
         attn_output = self.output_layer(attn_output)  # Shape: [batch_size, seq_len, d_model]
+        # Apply dropout to attention output before the residual connection
+        attn_output = self.attention_dropout(attn_output)
 
         # Residual connection after self-attention
         x = input_vecs + attn_output  # Shape: [batch_size, seq_len, d_model]
@@ -119,6 +127,9 @@ class TransformerLayer(nn.Module):
         # Feed-forward network
         ff_output = F.relu(self.fc1(x))  # Shape: [batch_size, seq_len, d_internal]
         ff_output = self.fc2(ff_output)  # Shape: [batch_size, seq_len, d_model]
+
+        # Apply dropout to feed-forward output before the residual connection
+        ff_output = self.ff_dropout(ff_output)
 
         # Residual connection after feed-forward layer
         output = x + ff_output  # Shape: [batch_size, seq_len, d_model]
@@ -141,6 +152,7 @@ class PositionalEncoding(nn.Module):
         # Dict size
         self.emb = nn.Embedding(num_positions, d_model)
         self.batched = batched
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
         """
@@ -154,22 +166,14 @@ class PositionalEncoding(nn.Module):
             # Use unsqueeze to form a [1, seq len, embedding dim] tensor -- broadcasting will ensure that this
             # gets added correctly across the batch
             emb_unsq = self.emb(indices_to_embed).unsqueeze(0)
-            return x + emb_unsq
+            x = x + emb_unsq
         else:
-            return x + self.emb(indices_to_embed)
+            x = x + self.emb(indices_to_embed)
+        return self.dropout(x)
 
 
 def train_classifier(args, train, dev):
-    # Assume the train examples contain the `vocab_index` used in `letter_counting.py`.
-    if len(train) > 0 and hasattr(train[0], 'input_indexed'):
-        vocab_index = Indexer()
-        for example in train:
-            for char_index in example.input_indexed:
-                vocab_index.add_and_get_index(char_index, add=True)
-    else:
-        raise ValueError("Training examples do not have input_indexed attribute.")
-
-    vocab_size = len(vocab_index)
+    vocab_size = 27
     d_model = 128
     d_internal = 64
     num_classes = 3
@@ -182,25 +186,30 @@ def train_classifier(args, train, dev):
 
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     loss_fcn = nn.NLLLoss()  # Negative Log-Likelihood Loss
-
+    batch_size=16
     num_epochs = 10
     for t in range(num_epochs):
+        # Training Phase
+        model.train()
         loss_this_epoch = 0.0
         random.seed(t)
         ex_idxs = [i for i in range(len(train))]
         random.shuffle(ex_idxs)
 
-        for ex_idx in ex_idxs:
-            example = train[ex_idx]
-            inputs = example.input_tensor.unsqueeze(0)  # Add batch dimension
-            targets = example.output_tensor
+        # Iterate over batches
+        for batch_start in range(0, len(train), batch_size):
+            batch_examples = [train[i] for i in ex_idxs[batch_start:batch_start + batch_size]]
+            
+            # Prepare the batch inputs and targets
+            inputs = torch.stack([ex.input_tensor for ex in batch_examples])  # Shape: [batch_size, seq_len]
+            targets = torch.stack([ex.output_tensor for ex in batch_examples])  # Shape: [batch_size, seq_len]
 
             # Forward pass
-            log_probs, _ = model(inputs)
-            log_probs = log_probs.squeeze(0)  # Remove batch dimension
+            log_probs, _ = model(inputs)  # log_probs shape: [batch_size, seq_len, num_classes]
 
             # Compute loss
-            loss = loss_fcn(log_probs, targets)
+            # We need to reshape log_probs and targets for compatibility with NLLLoss
+            loss = loss_fcn(log_probs.view(-1, num_classes), targets.view(-1))  # Flatten to [batch_size * seq_len, num_classes]
 
             # Backpropagation
             optimizer.zero_grad()
@@ -210,10 +219,35 @@ def train_classifier(args, train, dev):
             loss_this_epoch += loss.item()
 
         avg_loss = loss_this_epoch / len(train)
-        print(f"Epoch {t + 1}/{num_epochs}, Loss: {avg_loss:.4f}")
+        print(f"Epoch {t + 1}/{num_epochs}, Training Loss: {avg_loss:.4f}")
 
-    model.eval()
+        # Evaluation Phase
+        model.eval()
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for batch_start in range(0, len(dev), batch_size):
+                batch_examples = dev[batch_start:batch_start + batch_size]
+
+                # Prepare the batch inputs and targets
+                inputs = torch.stack([ex.input_tensor for ex in batch_examples])  # Shape: [batch_size, seq_len]
+                targets = torch.stack([ex.output_tensor for ex in batch_examples])  # Shape: [batch_size, seq_len]
+
+                # Forward pass
+                log_probs, _ = model(inputs)  # log_probs shape: [batch_size, seq_len, num_classes]
+                predictions = torch.argmax(log_probs, dim=-1)  # Get the predicted class for each position
+
+                # Compare predictions to targets
+                correct += (predictions == targets).sum().item()
+                total += targets.numel()
+
+        accuracy = correct / total
+        print(f"Epoch {t + 1}/{num_epochs}, Dev Accuracy: {accuracy:.4f}")
+
     return model
+
+
 
 
 ####################################
